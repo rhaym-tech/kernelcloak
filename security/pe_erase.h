@@ -6,9 +6,31 @@
 #if KC_ENABLE_PE_ERASE
 
 #if !defined(_NTDDK_) && !defined(_WDMDDK_)
+
+struct _MDL;
+
 extern "C" {
     unsigned char __stdcall MmIsAddressValid(void* VirtualAddress);
+
+    _MDL* __stdcall IoAllocateMdl(void* VirtualAddress, unsigned long Length,
+        unsigned char SecondaryBuffer, unsigned char ChargeQuota, void* Irp);
+    void __stdcall IoFreeMdl(_MDL* Mdl);
+    void __stdcall MmProbeAndLockPages(_MDL* MemoryDescriptorList,
+        char AccessMode, int Operation);
+    void* __stdcall MmMapLockedPagesSpecifyCache(_MDL* MemoryDescriptorList,
+        char AccessMode, int CacheType, void* RequestedAddress,
+        unsigned long BugCheckOnFailure, unsigned long Priority);
+    void __stdcall MmUnmapLockedPages(void* BaseAddress, _MDL* MemoryDescriptorList);
+    void __stdcall MmUnlockPages(_MDL* MemoryDescriptorList);
+
+    long __stdcall PsCreateSystemThread(void** ThreadHandle, unsigned long DesiredAccess,
+        void* ObjectAttributes, void* ProcessHandle, void* ClientId,
+        void (*StartRoutine)(void*), void* StartContext);
+    long __stdcall PsTerminateSystemThread(long ExitStatus);
+    long __stdcall KeDelayExecutionThread(char WaitMode, unsigned char Alertable, __int64* Interval);
+    long __stdcall ZwClose(void* Handle);
 }
+
 #endif
 
 // RtlSecureZeroMemory is a forceinline in WDK, not an export.
@@ -123,9 +145,69 @@ KC_NOINLINE inline void* find_driver_base() {
     return nullptr;
 }
 
-// erase PE headers from driver image
-// IRQL: PASSIVE_LEVEL - modifying own image pages
-// after this call, WinDbg !dh and similar tools will fail to parse the driver
+//
+// Zero memory through an MDL writable remap.
+// Header pages are mapped R/O by the loader so direct writes fault with 0xBE.
+// We lock the physical pages and create a second VA mapping with write access.
+//
+KC_NOINLINE inline bool mdl_zero_memory(void* addr, size_t len) {
+    auto* mdl = IoAllocateMdl(addr, static_cast<unsigned long>(len), 0, 0, nullptr);
+    if (!mdl)
+        return false;
+
+    __try {
+        MmProbeAndLockPages(mdl, 0 /*KernelMode*/, 0 /*IoReadAccess*/);
+    } __except (1) {
+        IoFreeMdl(mdl);
+        return false;
+    }
+
+    auto* mapped = MmMapLockedPagesSpecifyCache(
+        mdl, 0 /*KernelMode*/, 1 /*MmCached*/, nullptr, 0, 16 /*NormalPagePriority*/);
+
+    if (!mapped) {
+        MmUnlockPages(mdl);
+        IoFreeMdl(mdl);
+        return false;
+    }
+
+    secure_zero(mapped, len);
+
+    MmUnmapLockedPages(mapped, mdl);
+    MmUnlockPages(mdl);
+    IoFreeMdl(mdl);
+    return true;
+}
+
+struct pe_erase_context {
+    void* base;
+    unsigned long size;
+};
+
+KC_NOINLINE inline void pe_erase_thread(void* param) {
+    auto* ctx = static_cast<pe_erase_context*>(param);
+
+    /*++
+
+    MiSnapDriverRange parses our PE section table during IopLoadDriver
+    cleanup after DriverEntry returns. If headers are already zeroed,
+    it walks into NULL and we get bugcheck 0x7E. 150ms is plenty
+    for the loader to finish.
+
+    --*/
+    __int64 interval = -1500000;
+    KeDelayExecutionThread(0, 0, &interval);
+
+    mdl_zero_memory(ctx->base, ctx->size);
+
+    core::kc_pool_free(ctx);
+    PsTerminateSystemThread(0);
+}
+
+//
+// Erase PE headers from driver image. Defers the actual zeroing
+// to a system thread so we don't race MiFreeDriverInitialization.
+//
 KC_NOINLINE inline bool erase_pe_headers() {
     __try {
         void* base = find_driver_base();
@@ -149,7 +231,6 @@ KC_NOINLINE inline bool erase_pe_headers() {
         uint16_t num_sections = nt->FileHeader.NumberOfSections;
         uint16_t opt_hdr_size = nt->FileHeader.SizeOfOptionalHeader;
 
-        // sanity checks - avoid bad section math if headers are corrupted
         if (num_sections == 0 || num_sections > 96)
             return false;
         if (opt_hdr_size < sizeof(pe_optional_header64) || opt_hdr_size > 0x1000)
@@ -163,14 +244,12 @@ KC_NOINLINE inline bool erase_pe_headers() {
         uintptr_t erase_start = reinterpret_cast<uintptr_t>(base);
         size_t erase_size = erase_end - erase_start;
 
-        // clamp to SizeOfHeaders or 2 pages
         uint32_t size_of_headers = nt->OptionalHeader.SizeOfHeaders;
         if (erase_size > size_of_headers)
             erase_size = size_of_headers;
         if (erase_size > 0x2000)
             erase_size = 0x2000;
 
-        // validate all pages in range
         for (size_t offset = 0; offset < erase_size; offset += 0x1000) {
             if (!MmIsAddressValid(raw + offset))
                 return false;
@@ -178,7 +257,25 @@ KC_NOINLINE inline bool erase_pe_headers() {
         if (erase_size > 0 && !MmIsAddressValid(raw + erase_size - 1))
             return false;
 
-        secure_zero(raw, erase_size);
+        auto* ctx = static_cast<pe_erase_context*>(
+            core::kc_pool_alloc(sizeof(pe_erase_context)));
+        if (!ctx)
+            return false;
+
+        ctx->base = base;
+        ctx->size = static_cast<unsigned long>(erase_size);
+
+        void* thread_handle = nullptr;
+        long status = PsCreateSystemThread(
+            &thread_handle, 0, nullptr, nullptr, nullptr,
+            pe_erase_thread, ctx);
+
+        if (status < 0) {
+            core::kc_pool_free(ctx);
+            return false;
+        }
+
+        ZwClose(thread_handle);
         return true;
     } __except (1) {
         return false;
@@ -190,8 +287,8 @@ KC_NOINLINE inline bool erase_pe_headers() {
 } // namespace security
 } // namespace kernelcloak
 
-// erase PE headers from own driver image. call once at PASSIVE_LEVEL
-// after driver initialization is complete
+// erase PE headers from own driver image. safe to call from DriverEntry -
+// erasure is deferred until the kernel loader finishes post-DriverEntry cleanup.
 #define KC_ERASE_PE_HEADER() \
     (::kernelcloak::security::detail::erase_pe_headers())
 
